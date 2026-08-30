@@ -23,3 +23,11 @@ GROUP_LINK=https://chat.whatsapp.com/invite
 
 # Hosting
 PORT=3100
+
+# ── UPDATE 4: MongoDB Atlas for persistent sessions on Render Free ──
+# Get a free cluster at https://www.mongodb.com/atlas
+# Format: mongodb+srv://username:password@cluster.mongodb.net/?retryWrites=true&w=majority
+MONGODB_URI=
+
+# Optional — database name (defaults to 'voyage_xd')
+MONGODB_DB_NAME=voyage_xd
