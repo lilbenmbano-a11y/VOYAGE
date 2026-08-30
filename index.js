@@ -1,11 +1,14 @@
 /**
- * VOYAGE XD v3.0 — All-in-One Multi-User Bot
- * ✅ Fixed: Connection Closed error on messages
+ * VOYAGE XD v4.1.0 — UPDATE 2
+ * ✅ Fixed: Pairing disconnect / connection lifecycle
+ * ✅ Fixed: Duplicate socket creation & listener leaks
+ * ✅ Fixed: Duplicate handler registration on reconnect
+ * ✅ Fixed: Auth state preservation & session restoration
+ * ✅ Added: Comprehensive diagnostic logging
  * ✅ Per-user isolated store — no conflicts
  * ✅ Port 3000
  */
 require('dotenv').config();
-
 
 const fs        = require('fs');
 const path      = require('path');
@@ -24,7 +27,6 @@ const {
     jidDecode,
     makeCacheableSignalKeyStore,
     delay,
-    makeCacheableSignalKeyStore: makeCache
 } = require('@crysnovax/baileys');
 
 const { handleMessages, handleGroupParticipantUpdate } = require('./main');
@@ -37,6 +39,12 @@ const PORT    = process.env.PORT || process.env.BOT_PORT || 3100;
 const APP_URL = process.env.RENDER_EXTERNAL_URL || process.env.APP_URL || `http://localhost:${PORT}`;
 const PAIRING_TIMEOUT = 5 * 60 * 1000;
 
+// ── DIAGNOSTIC LOGGER ─────────────────────────────────────────────────────
+function log(tag, msg, isError = false) {
+    const line = `[VOYAGE-XD] ${tag}: ${msg}`;
+    if (isError) console.error(chalk.red(line));
+    else console.log(chalk.cyan(line));
+}
 
 // ── Ensure folders ─────────────────────────────────────────────────────────
 ['sessions','temp','data','public'].forEach(d => {
@@ -69,7 +77,6 @@ try { if(fs.existsSync(STATS_FILE)) totalPaired=JSON.parse(fs.readFileSync(STATS
 function saveStats() { try { fs.writeFileSync(STATS_FILE, JSON.stringify({total:totalPaired})); } catch {} }
 
 // ── Per-user in-memory message store ─────────────────────────────────────
-// Each bot gets its own store — no conflicts
 function createStore() {
     const messages = {};
     const MAX = 20;
@@ -101,6 +108,87 @@ function startKeepAlive() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+//  SOCKET LIFECYCLE HELPERS
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Properly destroy a socket and all its resources.
+ * Prevents duplicate listeners, memory leaks, and ghost connections.
+ */
+function destroySocket(phone) {
+    const bot = activeBots.get(phone);
+    if (!bot) return;
+
+    log('SOCKET', `Destroying socket for +${phone}`);
+
+    // Clear anti-sleep interval
+    if (bot.sleepIv) {
+        clearInterval(bot.sleepIv);
+        bot.sleepIv = null;
+    }
+
+    // Clear pairing timer
+    if (bot.timer) {
+        clearTimeout(bot.timer);
+        bot.timer = null;
+    }
+
+    // End the actual socket
+    if (bot.sock) {
+        try {
+            // Remove all event listeners before ending to prevent callbacks firing on dead socket
+            bot.sock.ev.removeAllListeners();
+            bot.sock.ws?.removeAllListeners();
+            bot.sock.end();
+        } catch (e) {
+            log('SOCKET', `Error ending socket for +${phone}: ${e.message}`, true);
+        }
+        bot.sock = null;
+    }
+
+    bot.status = 'disconnected';
+    log('SOCKET', `Socket destroyed for +${phone}`);
+}
+
+/**
+ * Controlled reconnect with exponential backoff.
+ */
+async function scheduleReconnect(phone, reason = 'unknown') {
+    const bot = activeBots.get(phone);
+    if (!bot) return;
+
+    // Prevent multiple concurrent reconnect attempts
+    if (bot._reconnecting) {
+        log('RECONNECT', `Reconnect already in progress for +${phone}, skipping duplicate`);
+        return;
+    }
+    bot._reconnecting = true;
+
+    // Calculate backoff: 5s, 10s, 20s, 40s, max 60s
+    bot._reconnectAttempts = (bot._reconnectAttempts || 0) + 1;
+    const backoff = Math.min(5000 * Math.pow(2, bot._reconnectAttempts - 1), 60000);
+    
+    log('RECONNECT', `Scheduling reconnect for +${phone} in ${backoff}ms (attempt ${bot._reconnectAttempts}, reason: ${reason})`);
+
+    await delay(backoff);
+
+    // Check if someone else already reconnected us
+    if (activeBots.get(phone)?.status === 'connected') {
+        log('RECONNECT', `+${phone} already connected, aborting scheduled reconnect`);
+        bot._reconnecting = false;
+        return;
+    }
+
+    try {
+        await reconnectBot(phone);
+    } catch (e) {
+        log('RECONNECT', `Reconnect failed for +${phone}: ${e.message}`, true);
+    } finally {
+        if (bot) bot._reconnecting = false;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 //  WEB SERVER
 // ══════════════════════════════════════════════════════════════════════════
 const app = express();
@@ -126,13 +214,16 @@ app.post('/pair', async (req, res) => {
     if (existing?.status === 'pairing')
         return res.status(429).json({ error: 'Pairing in progress. Enter the code in WhatsApp within 5 minutes.' });
 
-    activeBots.set(phone, { status: 'pairing', code: null, sock: null });
+    // Destroy any existing socket for this phone before starting fresh
+    destroySocket(phone);
+
+    activeBots.set(phone, { status: 'pairing', code: null, sock: null, sleepIv: null, timer: null, _handlersAttached: false, _reconnecting: false, _reconnectAttempts: 0 });
 
     const timer = setTimeout(() => {
         const b = activeBots.get(phone);
         if (b?.status === 'pairing') {
-            console.log(chalk.yellow(`⏰ Pairing expired: +${phone}`));
-            try { if(b.sock) b.sock.end(); } catch {}
+            log('PAIRING', `Pairing expired: +${phone}`);
+            destroySocket(phone);
             activeBots.delete(phone);
             cleanSession(phone);
         }
@@ -143,8 +234,9 @@ app.post('/pair', async (req, res) => {
         const code = await startPairing(phone, timer);
         return res.json({ success: true, code, phone, expires: '5 minutes' });
     } catch (err) {
+        destroySocket(phone);
         activeBots.delete(phone);
-        clearTimeout(timer);
+        log('PAIRING', `Pairing failed for +${phone}: ${err.message}`, true);
         return res.status(500).json({ error: err.message || 'Something went wrong. Please try again.' });
     }
 });
@@ -171,12 +263,18 @@ app.listen(PORT, '0.0.0.0', () => {
 //  START PAIRING
 // ══════════════════════════════════════════════════════════════════════════
 async function startPairing(phone, timer) {
+    log('PAIRING', `Pair command received for +${phone}`);
+    
     const sessionDir = `./sessions/${phone}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
+    log('PAIRING', `Generating pairing code for +${phone}`);
+
     const { version }          = await fetchLatestBaileysVersion();
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const userStore            = createStore(); // ✅ per-user store
+    const userStore            = createStore();
+
+    log('PAIRING', `Auth state loaded for +${phone} | creds exist: ${!!state.creds.me}`);
 
     const sock = makeWASocket({
         version,
@@ -192,19 +290,18 @@ async function startPairing(phone, timer) {
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs:   25000,
         markOnlineOnConnect:   true,
-        // ✅ per-user getMessage — no shared state
         getMessage: async (key) => {
             const msg = await userStore.loadMessage(jidNormalizedUser(key.remoteJid), key.id);
             return msg?.message || { conversation: '' };
         },
     });
 
-    // ✅ tag the sock with owner phone and user store
     sock._ownerPhone = phone;
     sock._userStore  = userStore;
 
+    // Save credentials whenever they update
     sock.ev.on('creds.update', saveCreds);
-    userStore.bind(sock.ev); // ✅ bind per-user store
+    userStore.bind(sock.ev);
 
     const bt = activeBots.get(phone);
     if (bt) bt.sock = sock;
@@ -213,9 +310,12 @@ async function startPairing(phone, timer) {
 
     let code;
     try {
+        log('PAIRING', `Requesting pairing code from WhatsApp for +${phone}`);
         code = await sock.requestPairingCode(phone);
         code = code?.match(/.{1,4}/g)?.join('-') || code;
+        log('PAIRING', `Pairing code generated for +${phone}: ${code}`);
     } catch (err) {
+        log('PAIRING', `Failed to generate pairing code for +${phone}: ${err.message}`, true);
         try { sock.end(); } catch {}
         throw new Error('Could not generate code. Make sure number is registered on WhatsApp.');
     }
@@ -223,21 +323,34 @@ async function startPairing(phone, timer) {
     const bots = activeBots.get(phone);
     if (bots) bots.code = code;
     console.log(chalk.yellow(`📱 Pairing: +${phone} | Code: ${code}`));
+    log('PAIRING', `Waiting for authentication for +${phone}`);
 
+    // ── Connection lifecycle handler ───────────────────────────────────
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
+        log('CONNECTION', `State for +${phone}: ${connection || 'undefined'} | lastDisconnect: ${lastDisconnect ? 'YES' : 'NO'}`);
 
         if (connection === 'open') {
             clearTimeout(timer);
+            log('CONNECTION', `Connection OPEN for +${phone}`);
             console.log(chalk.green(`✅ Connected: +${phone}`));
-            const b = activeBots.get(phone); if (b) b.status = 'connected';
+            
+            const b = activeBots.get(phone);
+            if (b) {
+                b.status = 'connected';
+                b._reconnectAttempts = 0; // Reset on successful connection
+            }
             totalPaired++; saveStats();
 
             // Auto-join channel and group
             setTimeout(async () => {
-                const { autoJoinChannel, autoJoinGroup } = require('./lib/autojoin');
-                await autoJoinChannel(sock);
-                await autoJoinGroup(sock);
+                try {
+                    const { autoJoinChannel, autoJoinGroup } = require('./lib/autojoin');
+                    await autoJoinChannel(sock);
+                    await autoJoinGroup(sock);
+                } catch (e) {
+                    log('AUTOJOIN', `Failed for +${phone}: ${e.message}`, true);
+                }
             }, 5000);
 
             // Welcome message
@@ -248,29 +361,84 @@ async function startPairing(phone, timer) {
                     image: { url: require('./settings').BOT_IMG },
                     caption: `*┏━━━━━━━━━━━━━━━━━━━┓*\n┃ ♤ *Connected to VOYAGE XD* ✅\n┃ ♤ *Status:* LIVE & Ready!\n┃ ♤ *Prefix:* [ . ]\n┃ ♤ *Try:* .menu | .ping | .alive\n┃ ♤ *Owner:* Send .setprefix or .mode\n*┗━━━━━━━━━━━━━━━━━━━┛*\n\n_VOYAGE XD© — Always On, Always Ready_`
                 });
-            } catch {}
+            } catch (e) {
+                log('WELCOME', `Failed to send welcome for +${phone}: ${e.message}`, true);
+            }
 
             startBotHandlers(sock, phone);
         }
 
         if (connection === 'close') {
             const errCode = lastDisconnect?.error?.output?.statusCode;
-            console.log(chalk.red(`⛔ Disconnected: +${phone} | Code: ${errCode}`));
-            if (errCode === DisconnectReason.loggedOut || errCode === 401) {
-                activeBots.delete(phone); cleanSession(phone); return;
+            const errMsg = lastDisconnect?.error?.message || 'No message';
+            log('DISCONNECT', `+${phone} disconnected | Code: ${errCode} | Message: ${errMsg}`);
+
+            // Determine reason and action
+            const reason = getDisconnectReason(errCode);
+            log('DISCONNECT', `Reason mapped: ${reason} for +${phone}`);
+
+            if (reason === 'logged_out' || reason === 'auth_failure') {
+                log('DISCONNECT', `Auth failure/logged out for +${phone}. Cleaning session.`);
+                destroySocket(phone);
+                activeBots.delete(phone);
+                cleanSession(phone);
+                return;
             }
+
+            if (reason === 'connection_replaced') {
+                log('DISCONNECT', `Connection replaced for +${phone}. Another instance connected. NOT reconnecting.`);
+                destroySocket(phone);
+                activeBots.delete(phone);
+                return;
+            }
+
+            if (reason === 'restart_required') {
+                log('DISCONNECT', `Restart required for +${phone}. Will reconnect.`);
+                const b = activeBots.get(phone);
+                if (b) b.status = 'reconnecting';
+                scheduleReconnect(phone, reason);
+                return;
+            }
+
+            // Temporary/network disconnect — reconnect with backoff
+            log('DISCONNECT', `Temporary disconnect for +${phone}. Scheduling reconnect.`);
             const b = activeBots.get(phone);
-            if (b) { b.status = 'reconnecting'; setTimeout(()=>reconnectBot(phone), 5000); }
+            if (b) b.status = 'reconnecting';
+            scheduleReconnect(phone, reason);
         }
     });
 
     return code;
 }
 
+/**
+ * Map Baileys disconnect codes to human-readable reasons.
+ */
+function getDisconnectReason(code) {
+    if (code === DisconnectReason.loggedOut || code === 401) return 'logged_out';
+    if (code === DisconnectReason.badSession) return 'bad_session';
+    if (code === DisconnectReason.connectionClosed) return 'connection_closed';
+    if (code === DisconnectReason.connectionLost) return 'connection_lost';
+    if (code === DisconnectReason.connectionReplaced) return 'connection_replaced';
+    if (code === DisconnectReason.timedOut) return 'timed_out';
+    if (code === DisconnectReason.restartRequired) return 'restart_required';
+    if (code === DisconnectReason.multideviceMismatch) return 'multidevice_mismatch';
+    return 'unknown';
+}
+
 // ══════════════════════════════════════════════════════════════════════════
-//  BOT MESSAGE HANDLERS — per user, isolated
+//  BOT MESSAGE HANDLERS — per user, isolated, NO DUPLICATES
 // ══════════════════════════════════════════════════════════════════════════
 function startBotHandlers(sock, phone) {
+    // Prevent duplicate handler registration on reconnect
+    if (sock._handlersAttached) {
+        log('HANDLERS', `Handlers already attached for +${phone}, skipping`);
+        return;
+    }
+    sock._handlersAttached = true;
+
+    log('HANDLERS', `Attaching handlers for +${phone}`);
+
     sock.decodeJid = (jid) => {
         if (!jid) return jid;
         if (/:\d+@/gi.test(jid)) { const d=jidDecode(jid)||{}; return d.user&&d.server?`${d.user}@${d.server}`:jid; }
@@ -280,8 +448,11 @@ function startBotHandlers(sock, phone) {
     try { const {getMode}=require('./commands/mode'); sock.public=getMode().mode!=='private'; } catch { sock.public=true; }
 
     // Anti-sleep
-    const sleepIv = setInterval(async()=>{ try { await sock.sendPresenceUpdate('available'); } catch {} }, 4*60*1000);
-    const bt = activeBots.get(phone); if (bt) bt.sleepIv = sleepIv;
+    const sleepIv = setInterval(async()=>{ 
+        try { await sock.sendPresenceUpdate('available'); } catch {} 
+    }, 4*60*1000);
+    const bt = activeBots.get(phone); 
+    if (bt) bt.sleepIv = sleepIv;
 
     // ── Messages ───────────────────────────────────────────────────────
     sock.ev.on('messages.upsert', async (update) => {
@@ -290,7 +461,6 @@ function startBotHandlers(sock, phone) {
             const mek = update.messages[0];
             if (!mek?.message) return;
 
-            // Unwrap ephemeral
             if (Object.keys(mek.message)[0] === 'ephemeralMessage')
                 mek.message = mek.message.ephemeralMessage.message;
 
@@ -305,7 +475,6 @@ function startBotHandlers(sock, phone) {
             if (!sender) return;
             if (isBanned(sender)) return;
 
-            // Private mode check
             if (!sock.public && !mek.key.fromMe && !await isOwnerFn(sender, sock, chatId)) return;
 
             // .session command
@@ -332,20 +501,19 @@ function startBotHandlers(sock, phone) {
             await handleMessages(sock, update);
 
         } catch(e) {
-            // Only log real errors, not Connection Closed noise
             if (!e.message?.includes('Connection Closed') && !e.message?.includes('connection')) {
                 console.error(`[${phone}] Error:`, e.message);
             }
         }
     });
 
-    // Anti-call (respects .anticall on/off setting)
+    // Anti-call
     sock.ev.on('call', async (calls) => {
         let anticallEnabled = false;
         try { anticallEnabled = require('./commands/anticall').isAnticallEnabled(); } catch {}
-        if (!anticallEnabled) return; // OFF = allow calls
+        if (!anticallEnabled) return;
         for (const call of calls) {
-            if (call.status !== 'offer') continue; // only reject incoming offers
+            if (call.status !== 'offer') continue;
             const jid = call.from||call.peerJid||call.chatId;
             if (!jid) continue;
             try {
@@ -364,8 +532,7 @@ function startBotHandlers(sock, phone) {
         try { await handleGroupParticipantUpdate(sock, u); } catch {}
     });
 
-
-    // ── Anti-Delete ────────────────────────────────────────────────────
+    // Anti-Delete
     sock.ev.on('messages.update', async (updates) => {
         try {
             const { isEnabled } = require('./commands/antidelete');
@@ -373,18 +540,13 @@ function startBotHandlers(sock, phone) {
 
             for (const update of updates) {
                 try {
-                    // stubType 7 = REVOKE (deleted for everyone)
                     if (update.update?.messageStubType !== 7) continue;
-
                     const msgId = update.key?.id;
                     const from  = update.key?.remoteJid;
                     if (!msgId || !from) continue;
 
-                    // Look up original from per-user store
                     const original = await sock._userStore.loadMessage(from, msgId);
                     if (!original?.message) continue;
-
-                    // Don't forward bot's own deletions
                     if (original.key?.fromMe) continue;
 
                     const msg      = original.message;
@@ -393,81 +555,87 @@ function startBotHandlers(sock, phone) {
                     const isGroup  = from.endsWith('@g.us');
                     const header   = `\u{1F5D1}\uFE0F *Anti-Delete Alert*\n\u{1F464} From: @${sender.split('@')[0]}\n\u{1F4CD} In: ${isGroup ? 'Group' : 'DM'}`;
 
-                    // ── Image ──
                     if (msg.imageMessage) {
                         await sock.sendMessage(ownerJid, {
                             image: { url: msg.imageMessage.url },
                             caption: header + (msg.imageMessage.caption ? `\n\u{1F4DD} ${msg.imageMessage.caption}` : ''),
                             mimetype: msg.imageMessage.mimetype || 'image/jpeg',
                         });
-                    }
-                    // ── Video ──
-                    else if (msg.videoMessage) {
+                    } else if (msg.videoMessage) {
                         await sock.sendMessage(ownerJid, {
                             video: { url: msg.videoMessage.url },
                             caption: header + (msg.videoMessage.caption ? `\n\u{1F4DD} ${msg.videoMessage.caption}` : ''),
                             mimetype: msg.videoMessage.mimetype || 'video/mp4',
                         });
-                    }
-                    // ── Audio / PTT ──
-                    else if (msg.audioMessage) {
+                    } else if (msg.audioMessage) {
                         await sock.sendMessage(ownerJid, {
                             audio: { url: msg.audioMessage.url },
                             mimetype: msg.audioMessage.mimetype || 'audio/ogg; codecs=opus',
                             ptt: msg.audioMessage.ptt || false,
                         });
                         await sock.sendMessage(ownerJid, { text: header });
-                    }
-                    // ── Sticker ──
-                    else if (msg.stickerMessage) {
+                    } else if (msg.stickerMessage) {
                         await sock.sendMessage(ownerJid, { sticker: { url: msg.stickerMessage.url } });
                         await sock.sendMessage(ownerJid, { text: header });
-                    }
-                    // ── Document ──
-                    else if (msg.documentMessage) {
+                    } else if (msg.documentMessage) {
                         await sock.sendMessage(ownerJid, {
                             document: { url: msg.documentMessage.url },
                             mimetype: msg.documentMessage.mimetype || 'application/octet-stream',
                             fileName: msg.documentMessage.fileName || 'file',
                             caption: header,
                         });
-                    }
-                    // ── Text / Extended text ──
-                    else if (msg.conversation || msg.extendedTextMessage?.text) {
+                    } else if (msg.conversation || msg.extendedTextMessage?.text) {
                         const text = msg.conversation || msg.extendedTextMessage?.text || '';
                         await sock.sendMessage(ownerJid, { text: `${header}\n\n\u{1F4AC} Message:\n${text}` });
-                    }
-                    // ── Anything else — just notify ──
-                    else {
+                    } else {
                         await sock.sendMessage(ownerJid, { text: `${header}\n\n_(Media type not recoverable)_` });
                     }
-
-                } catch (_) { /* silent — never crash bot */ }
+                } catch (_) {}
             }
-        } catch (_) { /* silent */ }
+        } catch (_) {}
     });
 
     console.log(chalk.green(`🤖 Handlers active: +${phone}`));
+    log('HANDLERS', `Handlers attached successfully for +${phone}`);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  RECONNECT
+//  RECONNECT — Safe, single-socket, with cleanup
 // ══════════════════════════════════════════════════════════════════════════
 async function reconnectBot(phone) {
+    log('RECONNECT', `Starting reconnect for +${phone}`);
+
     try {
         const sessionDir = `./sessions/${phone}`;
-        if (!fs.existsSync(`${sessionDir}/creds.json`)) { activeBots.delete(phone); return; }
+        if (!fs.existsSync(`${sessionDir}/creds.json`)) {
+            log('RECONNECT', `No creds.json found for +${phone}. Cannot reconnect.`);
+            activeBots.delete(phone);
+            return;
+        }
+
+        // CRITICAL: Destroy old socket before creating new one
+        destroySocket(phone);
 
         const { version }          = await fetchLatestBaileysVersion();
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const userStore            = createStore();
 
+        log('RECONNECT', `Auth state reloaded for +${phone} | user: ${state.creds.me?.id || 'none'}`);
+
         const sock = makeWASocket({
-            version, logger: pino({level:'silent'}), printQRInTerminal: false,
+            version, 
+            logger: pino({level:'silent'}), 
+            printQRInTerminal: false,
             browser: ['Ubuntu','Chrome','20.0.04'],
-            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({level:'fatal'}).child({level:'fatal'})) },
-            msgRetryCounterCache: new NodeCache(), connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000, keepAliveIntervalMs: 25000, markOnlineOnConnect: true,
+            auth: { 
+                creds: state.creds, 
+                keys: makeCacheableSignalKeyStore(state.keys, pino({level:'fatal'}).child({level:'fatal'})) 
+            },
+            msgRetryCounterCache: new NodeCache(), 
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000, 
+            keepAliveIntervalMs: 25000, 
+            markOnlineOnConnect: true,
             getMessage: async (key) => {
                 const msg = await userStore.loadMessage(jidNormalizedUser(key.remoteJid), key.id);
                 return msg?.message || { conversation: '' };
@@ -480,27 +648,66 @@ async function reconnectBot(phone) {
         userStore.bind(sock.ev);
 
         const bt = activeBots.get(phone);
-        if (bt) { bt.sock = sock; bt.status = 'reconnecting'; }
+        if (bt) { 
+            bt.sock = sock; 
+            bt.status = 'reconnecting';
+            bt._handlersAttached = false; // Allow handlers to re-attach on open
+        } else {
+            // Bot was deleted while we were preparing — clean up and abort
+            log('RECONNECT', `Bot entry missing for +${phone} during reconnect. Aborting.`);
+            try { sock.end(); } catch {}
+            return;
+        }
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
+            log('CONNECTION', `Reconnect state for +${phone}: ${connection || 'undefined'}`);
+
             if (connection === 'open') {
+                log('CONNECTION', `Reconnected successfully: +${phone}`);
                 console.log(chalk.green(`✅ Reconnected: +${phone}`));
-                const b = activeBots.get(phone); if (b) b.status = 'connected';
+                const b = activeBots.get(phone); 
+                if (b) {
+                    b.status = 'connected';
+                    b._reconnectAttempts = 0;
+                }
                 startBotHandlers(sock, phone);
             }
+
             if (connection === 'close') {
                 const errCode = lastDisconnect?.error?.output?.statusCode;
-                if (errCode === DisconnectReason.loggedOut || errCode === 401) {
-                    activeBots.delete(phone); cleanSession(phone); return;
+                const errMsg = lastDisconnect?.error?.message || 'No message';
+                log('DISCONNECT', `Reconnect close for +${phone} | Code: ${errCode} | ${errMsg}`);
+
+                const reason = getDisconnectReason(errCode);
+                log('DISCONNECT', `Reconnect reason: ${reason}`);
+
+                if (reason === 'logged_out' || reason === 'auth_failure' || reason === 'bad_session') {
+                    log('DISCONNECT', `Permanent failure for +${phone}. Cleaning.`);
+                    destroySocket(phone);
+                    activeBots.delete(phone);
+                    cleanSession(phone);
+                    return;
                 }
+
+                if (reason === 'connection_replaced') {
+                    log('DISCONNECT', `Connection replaced for +${phone}. Aborting reconnect.`);
+                    destroySocket(phone);
+                    activeBots.delete(phone);
+                    return;
+                }
+
                 const b = activeBots.get(phone);
-                if (b) { b.status='reconnecting'; setTimeout(()=>reconnectBot(phone), 10000); }
+                if (b) { 
+                    b.status = 'reconnecting';
+                    scheduleReconnect(phone, reason);
+                }
             }
         });
     } catch(e) {
-        console.error(`Reconnect error +${phone}:`, e.message);
-        setTimeout(()=>reconnectBot(phone), 15000);
+        log('RECONNECT', `Fatal reconnect error for +${phone}: ${e.stack || e.message}`, true);
+        const b = activeBots.get(phone);
+        if (b) scheduleReconnect(phone, 'error');
     }
 }
 
@@ -518,16 +725,36 @@ async function loadExistingSessions() {
         console.log(chalk.cyan(`♻️ Restoring ${dirs.length} session(s)...`));
         for (const phone of dirs) {
             if (activeBots.has(phone)) continue;
-            activeBots.set(phone, { status:'reconnecting', code:null, sock:null });
+            activeBots.set(phone, { status:'reconnecting', code:null, sock:null, sleepIv:null, timer:null, _handlersAttached: false, _reconnecting: false, _reconnectAttempts: 0 });
             await delay(2000);
             reconnectBot(phone);
         }
-    } catch(e) { console.error('Load sessions error:', e.message); }
+    } catch(e) { 
+        log('LOAD_SESSIONS', `Error: ${e.message}`, true); 
+    }
 }
 
 function cleanSession(phone) {
-    try { const d=`./sessions/${phone}`; if(fs.existsSync(d)) fs.rm(d,{recursive:true,force:true},()=>{}); } catch {}
+    try { 
+        const d=`./sessions/${phone}`; 
+        if(fs.existsSync(d)) fs.rm(d,{recursive:true,force:true},()=>{}); 
+    } catch {}
 }
 
-process.on('uncaughtException',  e => { if(!e.message?.includes('Connection')) console.error('Uncaught:', e.message); });
-process.on('unhandledRejection', e => { if(!String(e)?.includes('Connection')) console.error('Rejection:', e); });
+// ══════════════════════════════════════════════════════════════════════════
+//  GLOBAL ERROR HANDLERS — Expose real errors, do NOT hide them
+// ══════════════════════════════════════════════════════════════════════════
+process.on('uncaughtException', (e) => {
+    console.error(chalk.red(`[VOYAGE-XD] UNCAUGHT EXCEPTION:`));
+    console.error(e);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(chalk.red(`[VOYAGE-XD] UNHANDLED REJECTION at:`), promise);
+    console.error(chalk.red(`Reason:`), reason);
+});
+
+// Also catch exit to log why
+process.on('exit', (code) => {
+    log('PROCESS', `Process exiting with code ${code}`, code !== 0);
+});
