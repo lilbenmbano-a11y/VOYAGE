@@ -9,6 +9,7 @@ const os = require('os');
 const https = require('https');
 const http  = require('http');
 const settings = require('../settings');
+const userState = require('../lib/userState');
 const { reply, getSender, getIsOwner } = require('./_helper');
 
 function httpsGet(url) {
@@ -35,7 +36,7 @@ async function infoCmd(sock, chatId, message) {
     const bar = '█'.repeat(filled)+'░'.repeat(10-filled);
     await sock.sendMessage(chatId, { text: B('🤖 BOT INFO',[
         `📛 *Name    »* ${settings.botName}`,
-        `🔑 *Prefix  »* [ ${settings.prefix} ]`,
+        `🔑 *Prefix  »* [ ${userState.getPrefix(sock._ownerPhone, settings.prefix)} ]`,
         `🌐 *Mode    »* PUBLIC`,
         `🏷️ *Version »* v${settings.version}`,
         `💾 *RAM     »* [${bar}] ${pct}%`,

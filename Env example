@@ -9,6 +9,9 @@ BOT_NAME=VOYAGE XD
 PREFIX=.
 BOT_IMG=https://image2url.com/r2/default/images/1775559993680-0002e8ce-ab87-4349-9d60-5af0eb4dfd11.jpg
 
+# Optional — Menu design reference image shown by .menu / .help
+MENU_IMAGE_URL=
+
 # Optional — API keys (leave empty if not using download features)
 MALVIN_KEY=
 MALVIN_API=https://api.malvin.gleeze.com

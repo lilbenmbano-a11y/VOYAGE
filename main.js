@@ -12,6 +12,7 @@ const { isBanned }    = require('./lib/isBanned');
 const { getSender }   = require('./lib/getSender');
 const { makeIsOwner } = require('./lib/isOwner');
 const { getMode }     = require('./commands/mode');
+const userState       = require('./lib/userState');
 
 // Temp cleanup
 const tempDir = path.join(process.cwd(), 'temp');
@@ -157,6 +158,8 @@ const { handleAntilinkPlus, checkAntilinkPlus, PLATFORMS: AL_PLATFORMS } = requi
 const { getpp, getbio }              = require('./commands/getprofile');
 const { autostickerCommand, handleAutoSticker } = require('./commands/autosticker');
 const { quranCmd, alkitabCmd }       = require('./commands/quran');
+const bibleCmd                       = require('./commands/bible');   // was referenced in the switch below but never imported — fixed in Update 1
+const sessionCmd                     = require('./commands/session'); // existing command file, was never wired up — fixed in Update 1
 const mathquizCmd                    = require('./commands/mathquiz');
 const anonymouschatCmd               = require('./commands/anonymouschat');
 const { speedtestCmd, stickersearchCmd, shortquoteCmd, lifefactCmd, hackerquoteCmd, backupCmd } = require('./commands/extratools');
@@ -365,7 +368,10 @@ async function handleMessages(sock, update) {
             }
         } catch {}
 
-        const prefix = settings.prefix || '.';
+        // ✅ Per-user prefix — isolated per WhatsApp account (sock._ownerPhone),
+        // falls back to the global default in settings.js if this user hasn't
+        // customized theirs.
+        const prefix = userState.getPrefix(sock._ownerPhone, settings.prefix || '.');
         if (!rawText.trim().startsWith(prefix)) {
             if (rawText) await handleChatbot(sock, chatId, message, rawText);
             await mathquizCmd.checkAnswer(sock, chatId, message, rawText);
@@ -384,6 +390,7 @@ async function handleMessages(sock, update) {
             case 'runtime': case 'runtime2':   await runtimeCmd(sock,chatId,message); break;
             case 'owner':                      await ownerCmd(sock,chatId,message); break;
             case 'pair':                       await pairCmd(sock,chatId,message,args); break;
+            case 'session':                    await sessionCmd(sock,chatId,message); break;
             case 'deviceinfo': case 'sysinfo': await deviceCmd(sock,chatId,message); break;
             case 'sticker': case 's':          await stickerCmd(sock,chatId,message); break;
             case 'steal':                      await stealCmd(sock,chatId,message,args); break;
