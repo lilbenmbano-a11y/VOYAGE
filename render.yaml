@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: voyage-xd
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 3100
+      - key: BOT_NAME
+        value: VOYAGE XD
+      - key: NODE_ENV
+        value: production
+      - key: OWNER_NUMBER
+        sync: false
+    autoDeploy: true

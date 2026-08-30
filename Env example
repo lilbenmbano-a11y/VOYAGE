@@ -1,0 +1,22 @@
+# VOYAGE XD v4.1.0 — Environment Variables
+# Copy this file to .env and fill in your values
+
+# Required
+OWNER_NUMBER=263788114185
+
+# Optional — Bot identity
+BOT_NAME=VOYAGE XD
+PREFIX=.
+BOT_IMG=https://image2url.com/r2/default/images/1775559993680-0002e8ce-ab87-4349-9d60-5af0eb4dfd11.jpg
+
+# Optional — API keys (leave empty if not using download features)
+MALVIN_KEY=
+MALVIN_API=https://api.malvin.gleeze.com
+DAVID_API=https://apis.davidcyril.name.ng
+
+# Optional — Links
+CHANNEL_LINK=https://whatsapp.com/channel/0029VaZGBAFLY6UdyPTRHo3Y
+GROUP_LINK=https://chat.whatsapp.com/invite
+
+# Hosting
+PORT=3100
